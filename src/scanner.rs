@@ -19,7 +19,6 @@
 // just got passed in.  (The indication must be delayed in order
 // to recognize the end of numbers: is 123 a whole value or
 // the beginning of 12345e+6?).
-use std::error::Error;
 
 // Continue.
 const scanContinue: u8 = 0;
@@ -66,20 +65,19 @@ struct Scanner {
     end_top: bool,
     // Stack of what we're in the middle of - array values, object keys, object values.
     parse_state: Vec<u8>,
-    error:Option<Error>,
+    error: Option<String>,
     // total bytes consumed, updated by decoder.Decode
     bytes: i64,
 }
 
-// Implementation block, all `Point` methods go in here
 impl Scanner {
     // reset prepares the scanner for use.
     // It must be called before calling s.step.
-    fn reset(&mut self) -> &Scanner {
+    fn reset(&mut self) {
         self.step = stateBeginValue;
         self.end_top = false;
         self.parse_state = vec![];
-        self.error = ();
+        self.error = None;
         self.bytes = 0;
     }
     // eof tells the scanner that the end of input has been reached.
@@ -87,35 +85,38 @@ impl Scanner {
     fn eof(&mut self) -> u8 {
         if self.error.is_some() {
             return scanError;
+        }
+        if self.end_top {
+            return scanEnd;
+        }
+        (self.step)(self, ' ');
+        if self.end_top {
+            return scanEnd;
+        }
 
-            if self.endTop {
-                return scanEnd;
-            }
-            self.step(self, ' ');
-            if self.endTop {
-                return scanEnd;
-            }
+        if self.error.is_none() {
 
-            if self.error.is_none() {
-                // s.err = &SyntaxError { "unexpected end of JSON input", s.bytes
-                self.err = Err("unexpected end of JSON input")
-            }
+            let err:String ="unexpected end of JSON input".parse().unwrap();
+            // s.err = &SyntaxError { "unexpected end of JSON input", s.bytes
+            self.error = Some(err);
         }
         return scanError;
     }
+
+
     // pushParseState pushes a new parse state p onto the parse stack.
     fn pushParseState(&mut self, p: u8) {
         self.parse_state.push(p);
     }
 
     // popParseState pops a parse state (already obtained) off the stack
-    // and updates s.step accordingly.
+// and updates s.step accordingly.
     fn popParseState(&mut self) {
         let n: usize = self.parse_state.len() - 1;
         let _ = self.parse_state.pop();
         if n == 0 {
             self.step = state_end_top;
-            self.endTop = true
+            self.end_top = true
         } else {
             self.step = state_end_value
         }
@@ -123,9 +124,9 @@ impl Scanner {
 
 
     // error records an error and switches to the error state.
-    fn error(&mut self, c: char, context: String) -> u8 {
+    fn error(&mut self, c: char, context: &str) -> u8 {
         self.step = stateError;
-        self.err = Err("invalid character " + quoteChar(c) + " " + context);//todo pass bytes
+        self.error = Option::from("invalid character ".to_string() + c.to_string().as_ref() + " " + context);//todo pass bytes
         return scanError;
     }
 }
@@ -190,13 +191,14 @@ fn stateBeginValue(s: &mut Scanner, c: char) -> u8 {
             s.step = stateN;
             return scanBeginLiteral;
         }
-        _ => { panic!("ups") }//all the other cases
+        _ => {
+            if '1' <= c && c <= '9' { // beginning of 1234.5
+                s.step = state1;
+                return scanBeginLiteral;
+            }
+            return s.error(c, "looking for beginning of value");
+        }//all the other cases
     }
-    if '1' <= c && c <= '9' { // beginning of 1234.5
-        s.step = state1;
-        return scanBeginLiteral;
-    }
-    return s.error(c, "looking for beginning of value");
 }
 
 
@@ -207,7 +209,7 @@ fn stateBeginStringOrEmpty(s: &mut Scanner, c: char) -> u8 {
     }
     if c == '}' {
         let n: usize = s.parse_state.len();
-        s.parseState[n - 1] = parseObjectValue;
+        s.parse_state[n - 1] = parseObjectValue;
         return state_end_value(s, c);
     }
     return stateBeginString(s, c);
@@ -232,21 +234,22 @@ fn stateBeginString(s: &mut Scanner, c: char) -> u8 {
 fn state_end_value(s: &mut Scanner, c: char) -> u8 {
     let n: usize = s.parse_state.len();
     if n == 0 {
-        // Completed top-level before the current byte.
+// Completed top-level before the current byte.
         s.step = state_end_top;
-        s.endTop = true;
+        s.end_top = true;
         return state_end_top(s, c);
     }
     if c <= ' ' && isSpace(c) {
         s.step = state_end_value;
         return scanSkipSpace;
     }
-    let ps: usize = s.parse_state.len() - 1;
+    let i: usize = s.parse_state.len() - 1;
+    let ps: u8 = s.parse_state[i];
 
     match ps {
         parseObjectKey => {
             if c == ':' {
-                s.parseState[n - 1] = parseObjectValue;
+                s.parse_state[n - 1] = parseObjectValue;
                 s.step = stateBeginValue;
                 return scanObjectKey;
             }
@@ -254,7 +257,7 @@ fn state_end_value(s: &mut Scanner, c: char) -> u8 {
         }
         parseObjectValue => {
             if c == ',' {
-                s.parseState[n - 1] = parseObjectKey;
+                s.parse_state[n - 1] = parseObjectKey;
                 s.step = stateBeginString;
                 return scanObjectValue;
             }
@@ -275,9 +278,8 @@ fn state_end_value(s: &mut Scanner, c: char) -> u8 {
             }
             return s.error(c, "after array element");
         }
-        _ => { panic!("ups") }
+        _ => { return s.error(c, ""); }
     }
-    return s.error(c, "");
 }
 
 // state_end_top is the state after finishing the top-level value,
@@ -285,8 +287,8 @@ fn state_end_value(s: &mut Scanner, c: char) -> u8 {
 // Only space characters should be seen now.
 fn state_end_top(s: &mut Scanner, c: char) -> u8 {
     if !isSpace(c) {
-        // Complain about non-space byte on next call.
-        s.error(c, "after top-level value")
+// Complain about non-space byte on next call.
+        s.error(c, "after top-level value");
     }
     return scanEnd;
 }
@@ -331,7 +333,7 @@ fn state_in_string_esc_u(s: &mut Scanner, c: char) -> u8 {
         s.step = state_in_string_esc_u1;
         return scanContinue;
     }
-    // numbers
+// numbers
     return s.error(c, "in \\u hexadecimal character escape");
 }
 
@@ -341,7 +343,7 @@ fn state_in_string_esc_u1(s: &mut Scanner, c: char) -> u8 {
         s.step = state_in_string_esc_u12;
         return scanContinue;
     }
-    // numbers
+// numbers
     return s.error(c, "in \\u hexadecimal character escape");
 }
 
@@ -352,7 +354,7 @@ fn state_in_string_esc_u12(s: &mut Scanner, c: char) -> u8 {
         s.step = state_in_string_esc_u123;
         return scanContinue;
     }
-    // numbers
+// numbers
     return s.error(c, "in \\u hexadecimal character escape");
 }
 
@@ -362,7 +364,7 @@ fn state_in_string_esc_u123(s: &mut Scanner, c: char) -> u8 {
         s.step = state_in_string;
         return scanContinue;
     }
-    // numbers
+// numbers
     return s.error(c, "in \\u hexadecimal character escape");
 }
 
@@ -551,23 +553,6 @@ fn stateNul(s: &mut Scanner, c: char) -> u8 {
 // such as after reading `[1}` or `5.1.2`.
 fn stateError(s: &mut Scanner, c: char) -> u8 {
     return scanError;
-}
-
-
-// quoteChar formats c as a quoted character literal
-fn quoteChar(c: char) -> String {
-// special cases - different from quoted strings
-    if c == '\'' {
-        return r#"{'\''}"#.parse().unwrap();
-    }
-    if c == '"' {
-        return r#"{'"'}}"#.parse().unwrap();
-    }
-    use quoted_string::quote;
-
-    // use quoted string with different quotation marks
-    let s:String = quoteChar(c);
-    return "'" + s[1: s.lenght() - 1] + "'";
 }
 
 
